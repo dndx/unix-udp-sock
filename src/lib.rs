@@ -2,11 +2,9 @@
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
 };
 
 pub use crate::cmsg::{AsPtr, EcnCodepoint, Source, Transmit};
-use tracing::warn;
 
 mod cmsg;
 
@@ -90,26 +88,5 @@ impl Default for RecvMeta {
             dst_local_ip: None,
             ifindex: 0,
         }
-    }
-}
-
-/// Log at most 1 IO error per minute
-const IO_ERROR_LOG_INTERVAL: Duration = std::time::Duration::from_secs(60);
-
-/// Logs a warning message when sendmsg fails
-///
-/// Logging will only be performed if at least [`IO_ERROR_LOG_INTERVAL`]
-/// has elapsed since the last error was logged.
-fn log_sendmsg_error<B: AsPtr<u8>>(
-    last_send_error: &mut Instant,
-    err: impl core::fmt::Debug,
-    transmit: &Transmit<B>,
-) {
-    let now = Instant::now();
-    if now.saturating_duration_since(*last_send_error) > IO_ERROR_LOG_INTERVAL {
-        *last_send_error = now;
-        warn!(
-        "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, enc: {:?}, len: {:?}, segment_size: {:?} }}",
-            err, transmit.dst, transmit.src, transmit.ecn, transmit.contents.len(), transmit.segment_size);
     }
 }

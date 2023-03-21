@@ -7,7 +7,6 @@ use std::{
     ptr,
     sync::atomic::AtomicUsize,
     task::{Context, Poll},
-    time::Instant,
 };
 
 use crate::cmsg::{AsPtr, EcnCodepoint, Source, Transmit};
@@ -18,7 +17,7 @@ use tokio::{
     net::ToSocketAddrs,
 };
 
-use super::{cmsg, log_sendmsg_error, RecvMeta, UdpState, IO_ERROR_LOG_INTERVAL};
+use super::{cmsg, RecvMeta, UdpState};
 
 #[cfg(target_os = "freebsd")]
 type IpTosTy = libc::c_uchar;
@@ -32,7 +31,6 @@ type IpTosTy = libc::c_int;
 #[derive(Debug)]
 pub struct UdpSocket {
     io: tokio::net::UdpSocket,
-    last_send_error: Instant,
 }
 
 impl AsRawFd for UdpSocket {
@@ -47,10 +45,8 @@ impl UdpSocket {
         socket.set_nonblocking(true)?;
 
         init(SockRef::from(&socket))?;
-        let now = Instant::now();
         Ok(UdpSocket {
             io: tokio::net::UdpSocket::from_std(socket)?,
-            last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
         })
     }
 
@@ -62,11 +58,7 @@ impl UdpSocket {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let io = tokio::net::UdpSocket::bind(addr).await?;
         init(SockRef::from(&io))?;
-        let now = Instant::now();
-        Ok(UdpSocket {
-            io,
-            last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
-        })
+        Ok(UdpSocket { io })
     }
 
     /// sets the value of SO_BROADCAST for this socket
@@ -190,16 +182,15 @@ impl UdpSocket {
     ///
     /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
     pub async fn send_mmsg<B: AsPtr<u8>>(
-        &mut self,
+        &self,
         state: &UdpState,
         transmits: &[Transmit<B>],
     ) -> Result<usize, io::Error> {
         let n = loop {
             self.io.writable().await?;
-            let last_send_error = &mut self.last_send_error;
             let io = &self.io;
             match io.try_io(Interest::WRITABLE, || {
-                send(state, SockRef::from(io), last_send_error, transmits)
+                send(state, SockRef::from(io), transmits)
             }) {
                 Ok(res) => break res,
                 Err(_would_block) => continue,
@@ -267,17 +258,16 @@ impl UdpSocket {
 
     /// calls `sendmmsg`
     pub fn poll_send_mmsg<B: AsPtr<u8>>(
-        &mut self,
+        &self,
         state: &UdpState,
         cx: &mut Context,
         transmits: &[Transmit<B>],
     ) -> Poll<io::Result<usize>> {
         loop {
-            let last_send_error = &mut self.last_send_error;
             ready!(self.io.poll_send_ready(cx))?;
             let io = &self.io;
             if let Ok(res) = io.try_io(Interest::WRITABLE, || {
-                send(state, SockRef::from(io), last_send_error, transmits)
+                send(state, SockRef::from(io), transmits)
             }) {
                 return Poll::Ready(Ok(res));
             }
@@ -348,7 +338,6 @@ pub mod sync {
     #[derive(Debug)]
     pub struct UdpSocket {
         io: std::net::UdpSocket,
-        last_send_error: Instant,
     }
 
     impl AsRawFd for UdpSocket {
@@ -366,21 +355,13 @@ pub mod sync {
         /// Creates a new UDP socket from a previously created `std::net::UdpSocket`
         pub fn from_std(socket: std::net::UdpSocket) -> io::Result<Self> {
             init(SockRef::from(&socket))?;
-            let now = Instant::now();
-            Ok(Self {
-                io: socket,
-                last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
-            })
+            Ok(Self { io: socket })
         }
         /// create a new UDP socket and attempt to bind to `addr`
         pub fn bind<A: std::net::ToSocketAddrs>(addr: A) -> io::Result<Self> {
             let io = std::net::UdpSocket::bind(addr)?;
             init(SockRef::from(&io))?;
-            let now = Instant::now();
-            Ok(Self {
-                io,
-                last_send_error: now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now),
-            })
+            Ok(Self { io })
         }
         /// sets nonblocking mode
         pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
@@ -460,16 +441,11 @@ pub mod sync {
         ///
         /// [`sendmmsg`]: https://linux.die.net/man/2/sendmmsg
         pub fn send_mmsg<B: AsPtr<u8>>(
-            &mut self,
+            &self,
             state: &UdpState,
             transmits: &[Transmit<B>],
         ) -> Result<usize, io::Error> {
-            send(
-                state,
-                SockRef::from(&self.io),
-                &mut self.last_send_error,
-                transmits,
-            )
+            send(state, SockRef::from(&self.io), transmits)
         }
         /// Calls syscall [`sendmsg`]. With a given `state` configured GSO and
         /// `transmit` with information on the data and metadata about outgoing packet.
@@ -677,14 +653,6 @@ fn send_msg<B: AsPtr<u8>>(
                         }
                     }
 
-                    // Other errors are ignored, since they will ususally be handled
-                    // by higher level retransmits and timeouts.
-                    // - PermissionDenied errors have been observed due to iptable rules.
-                    //   Those are not fatal errors, since the
-                    //   configuration can be dynamically changed.
-                    // - Destination unreachable errors have been observed for other
-                    // log_sendmsg_error(last_send_error, e, &transmits[0]);
-
                     // The ERRORS section in https://man7.org/linux/man-pages/man2/sendmmsg.2.html
                     // describes that errors will only be returned if no message could be transmitted
                     // at all. Therefore drop the first (problematic) message,
@@ -701,7 +669,6 @@ fn send_msg<B: AsPtr<u8>>(
 fn send<B: AsPtr<u8>>(
     state: &UdpState,
     io: SockRef<'_>,
-    last_send_error: &mut Instant,
     transmits: &[Transmit<B>],
 ) -> io::Result<usize> {
     let mut msgs: [libc::mmsghdr; BATCH_SIZE] = unsafe { mem::zeroed() };
@@ -757,14 +724,6 @@ fn send<B: AsPtr<u8>>(
                         }
                     }
 
-                    // Other errors are ignored, since they will ususally be handled
-                    // by higher level retransmits and timeouts.
-                    // - PermissionDenied errors have been observed due to iptable rules.
-                    //   Those are not fatal errors, since the
-                    //   configuration can be dynamically changed.
-                    // - Destination unreachable errors have been observed for other
-                    log_sendmsg_error(last_send_error, e, &transmits[0]);
-
                     // The ERRORS section in https://man7.org/linux/man-pages/man2/sendmmsg.2.html
                     // describes that errors will only be returned if no message could be transmitted
                     // at all. Therefore drop the first (problematic) message,
@@ -801,13 +760,6 @@ fn send(
                 io::ErrorKind::WouldBlock if sent != 0 => return Ok(sent),
                 io::ErrorKind::WouldBlock => return Err(e),
                 _ => {
-                    // Other errors are ignored, since they will ususally be handled
-                    // by higher level retransmits and timeouts.
-                    // - PermissionDenied errors have been observed due to iptable rules.
-                    //   Those are not fatal errors, since the
-                    //   configuration can be dynamically changed.
-                    // - Destination unreachable errors have been observed for other
-                    log_sendmsg_error(last_send_error, e, &transmits[sent]);
                     sent += 1;
                 }
             }

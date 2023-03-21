@@ -223,6 +223,16 @@ impl<T> AsPtr<T> for [T] {
         self.len()
     }
 }
+
+impl AsPtr<u8> for &[u8] {
+    fn as_ptr(&self) -> *const u8 {
+        <[u8]>::as_ptr(self)
+    }
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+}
+
 impl AsPtr<u8> for BytesMut {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self.as_ref())
